@@ -1,132 +1,132 @@
 #!/usr/bin/env python3
-"""ai-happy-01 entry (make.fun "Make the AI judge happy").
+"""Copy the bundled happy-image JPEG to the scorer's output folder.
 
-The art is the entry.png bundled beside this file: "Best Judge Ever!",
-a small robot judge in a wig on a podium in a sunny park, holding a
-giant sunflower like a trophy while children, a puppy, a kitten and a
-rabbit cheer under a hand-painted banner that reads BEST JUDGE EVER!
-
-This program copies those exact bytes to /output/entry.png. It uses only
-the Python standard library, touches no network, reads no clock, and
-writes the same bytes on every run, so two runs are byte-identical.
+The image itself lives next to this file as ``entry.png`` (a JPEG despite
+the name).  This script only validates it against the competition limits
+and copies it, byte for byte, to ``$MAKEFUN_OUTPUT_DIR/entry.png``.
+Standard library only, no network, no clock.
 """
 
-import hashlib
 import os
 import sys
+from pathlib import Path
+
+MAX_BYTES = 1_048_576          # 1 MiB
+MAX_SIDE = 1024                # longest allowed edge, in pixels
+JPEG_SOI = b"\xff\xd8\xff"     # start-of-image magic
+JPEG_EOI = b"\xff\xd9"         # end-of-image marker
+JPEG_SOS = b"\xff\xda"         # start-of-scan marker
+SOF_MARKERS = {0xC0, 0xC2}     # baseline + progressive DCT frames
 
 
-def sha256_of(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def complain(message: str) -> int:
+    """Print a one-line error to stderr and report failure."""
+    print(f"entry: error: {message}", file=sys.stderr)
+    return 1
 
 
-def jpeg_dimensions(data: bytes) -> tuple:
-    """Return (width, height) from the first SOF marker, or (0, 0).
+def jpeg_dimensions(blob: bytes):
+    """Return (width, height) read from the first SOF0/SOF2 segment.
 
-    Walks the JPEG marker segments after the SOI marker; SOF0/SOF2
-    carry height then width as big-endian 16-bit values. Returns
-    (0, 0) when no SOF marker is found, so callers can treat an
-    unparseable header as a failure instead of guessing.
+    Walks the JPEG marker stream starting after the SOI marker.  Returns
+    ``None`` when no SOF segment is found or the stream is truncated.
     """
-    i = 2  # skip SOI (FF D8)
-    while i + 9 < len(data):
-        if data[i] != 0xFF:
-            return (0, 0)
-        marker = data[i + 1]
-        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
-            i += 2
+    pos = 2  # skip the SOI marker
+    end = len(blob)
+    while pos + 1 < end:
+        if blob[pos] != 0xFF:
+            # Padding / stray byte: move on one byte at a time.
+            pos += 1
             continue
-        seg_len = int.from_bytes(data[i + 2:i + 4], "big")
-        if marker in (0xC0, 0xC1, 0xC2):
-            height = int.from_bytes(data[i + 5:i + 7], "big")
-            width = int.from_bytes(data[i + 7:i + 9], "big")
-            return (width, height)
-        i += 2 + seg_len
-    return (0, 0)
+        marker = blob[pos + 1]
+        if marker == 0xFF:
+            pos += 1
+            continue
+        if marker in (0x00, 0x01) or 0xD0 <= marker <= 0xD9:
+            # Standalone markers (RSTn, SOI, EOI, TEM) carry no length.
+            pos += 2
+            continue
+        if pos + 4 > end:
+            return None
+        seg_len = (blob[pos + 2] << 8) | blob[pos + 3]
+        if seg_len < 2 or pos + 2 + seg_len > end:
+            return None
+        if marker in SOF_MARKERS:
+            # SOF payload: precision (1), height (2), width (2), ...
+            if seg_len < 7:
+                return None
+            height = (blob[pos + 5] << 8) | blob[pos + 6]
+            width = (blob[pos + 7] << 8) | blob[pos + 8]
+            return width, height
+        if marker == 0xDA:
+            # Start of scan: entropy data follows, no SOF can come after.
+            return None
+        pos += 2 + seg_len
+    return None
 
 
-def main() -> int:
-    here = os.path.dirname(os.path.abspath(__file__))
-    source = os.path.join(here, "entry.png")
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    if not out_dir:
-        # An explicitly empty MAKEFUN_OUTPUT_DIR must not resolve the
-        # target into the current working directory; fall back to the
-        # default output directory instead.
-        out_dir = "/output"
-    target = os.path.join(out_dir, "entry.png")
+def check_image(blob: bytes) -> str | None:
+    """Validate the JPEG bytes; return an error string or None when fine."""
+    if not blob:
+        return "entry.png is empty"
+    if len(blob) > MAX_BYTES:
+        return f"entry.png is {len(blob)} bytes, over the 1048576 byte limit"
+    if blob[:3] != JPEG_SOI:
+        return "entry.png does not start with the JPEG magic bytes FF D8 FF"
+    if JPEG_SOS not in blob:
+        return "entry.png has no SOS (FF DA) marker"
+    if blob[-2:] != JPEG_EOI:
+        return "entry.png does not end with the EOI marker FF D9"
+    size = jpeg_dimensions(blob)
+    if size is None:
+        return "entry.png has no readable SOF0/SOF2 segment"
+    width, height = size
+    if width <= 0 or height <= 0:
+        return f"entry.png has invalid dimensions {width}x{height}"
+    if width > MAX_SIDE or height > MAX_SIDE:
+        return f"entry.png is {width}x{height}, over the 1024x1024 limit"
+    return None
 
-    with open(source, "rb") as f:
-        data = f.read()
 
-    # An empty file is not an image at all: refuse it with a clear
-    # message before any later check can misread it as a bad header.
-    if len(data) == 0:
-        print("entry.png: empty file (0 bytes)", file=sys.stderr)
-        return 1
+def run() -> int:
+    here = Path(__file__).resolve().parent
+    source = here / "entry.png"
+    if not source.is_file():
+        return complain("entry.png is missing next to main.py")
 
-    # The bundled art must be a real JPEG: refuse anything else before
-    # writing, so a wrong file can never be submitted silently.
-    if data[:3] != b"\xff\xd8\xff":
-        print("entry.png: not a JPEG file", file=sys.stderr)
-        return 1
+    try:
+        blob = source.read_bytes()
+    except OSError as exc:
+        return complain(f"cannot read entry.png: {exc}")
 
-    # The gate caps the image at 1 MiB: refuse an oversize file before
-    # writing, so a bad resize can never be submitted silently.
-    if len(data) > 1048576:
-        print(f"entry.png: {len(data)} bytes exceeds the 1 MiB gate",
-              file=sys.stderr)
-        return 1
+    problem = check_image(blob)
+    if problem is not None:
+        return complain(problem)
 
-    # A whole JPEG ends with the EOI marker: refuse a truncated file,
-    # since the gate scores only complete images.
-    if data[-2:] != b"\xff\xd9":
-        print("entry.png: truncated JPEG (no EOI marker)",
-              file=sys.stderr)
-        return 1
+    out_dir = (os.environ.get("MAKEFUN_OUTPUT_DIR") or "").strip() or "/output"
+    target = Path(out_dir) / "entry.png"
+    if target.resolve() == source.resolve():
+        # Copying onto itself would prove nothing; refuse instead.
+        return complain("output entry.png would overwrite the source file")
+    out_path = Path(out_dir)
+    if out_path.exists() and not out_path.is_dir():
+        return complain(f"output path {out_dir} exists and is not a directory")
+    try:
+        out_path.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(blob)
+    except OSError as exc:
+        return complain(f"cannot write {target}: {exc}")
 
-    # The gate caps images at 1024x1024: refuse anything larger before
-    # writing, so an oversize resize can never be submitted silently.
-    width, height = jpeg_dimensions(data)
-    if width == 0 or height == 0:
-        print("entry.png: no SOF marker (unparseable JPEG header)",
-              file=sys.stderr)
-        return 1
-    if width > 1024 or height > 1024:
-        print(f"entry.png: {width}x{height} exceeds the 1024x1024 gate",
-              file=sys.stderr)
-        return 1
+    try:
+        written = target.read_bytes()
+    except OSError as exc:
+        return complain(f"cannot re-read {target}: {exc}")
+    if written != blob:
+        return complain("written entry.png differs from the source bytes")
 
-    # A real JPEG carries at least one SOS (start of scan) marker with
-    # image data behind it: refuse a header-only file, since the gate
-    # scores the picture, not an empty frame.
-    if b"\xff\xda" not in data:
-        print("entry.png: no SOS marker (no image data)",
-              file=sys.stderr)
-        return 1
-
-    os.makedirs(out_dir, exist_ok=True)
-    with open(target, "wb") as f:
-        f.write(data)
-
-    # Confirm the copy is byte-identical, not just the same length: a
-    # same-length but corrupted write must fail loudly, since the gate
-    # scores the exact bytes written.
-    written = os.path.getsize(target)
-    digest = sha256_of(target)
-    if written != len(data) or digest != sha256_of(source):
-        print(f"entry.png: copy failed integrity check "
-              f"(wrote {written} of {len(data)} bytes)",
-              file=sys.stderr)
-        return 1
-    print(f"entry.png: {written} bytes -> {target} (sha256 {digest})",
-          file=sys.stderr)
+    print(f"wrote {target} ({len(blob)} bytes)")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(run())
