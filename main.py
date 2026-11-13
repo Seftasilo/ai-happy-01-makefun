@@ -53,10 +53,21 @@ def main() -> int:
     here = os.path.dirname(os.path.abspath(__file__))
     source = os.path.join(here, "entry.png")
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    if not out_dir:
+        # An explicitly empty MAKEFUN_OUTPUT_DIR must not resolve the
+        # target into the current working directory; fall back to the
+        # default output directory instead.
+        out_dir = "/output"
     target = os.path.join(out_dir, "entry.png")
 
     with open(source, "rb") as f:
         data = f.read()
+
+    # An empty file is not an image at all: refuse it with a clear
+    # message before any later check can misread it as a bad header.
+    if len(data) == 0:
+        print("entry.png: empty file (0 bytes)", file=sys.stderr)
+        return 1
 
     # The bundled art must be a real JPEG: refuse anything else before
     # writing, so a wrong file can never be submitted silently.
